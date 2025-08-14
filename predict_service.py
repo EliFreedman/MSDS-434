@@ -1,30 +1,26 @@
 import os
-import re
-import math
-import tarfile
-import pickle
-from collections import Counter
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote
 
-import boto3
 import pandas as pd
-import tldextract
 import xgboost as xgb
 from fastapi import FastAPI, HTTPException
 
-# =====================
-# ENV CONFIG
-# =====================
+from data_ingestion import download_and_extract_from_s3, load_bst_model
+from data_processing import extract_url_features
+
+# This functions when utilizing an AWS EC2 cluster with the provisioned roles
 MODEL_S3_BUCKET = os.environ.get("MODEL_S3_BUCKET", "malicious-url-project")
 MODEL_S3_KEY = os.environ.get(
     "MODEL_S3_KEY",
-    "url-model-xgboost/output/sagemaker-xgboost-2025-08-09-22-58-52-766/output/model.tar.gz"
+    (
+        "url-model-xgboost/output/"
+        "sagemaker-xgboost-2025-08-09-22-58-52-766/output/model.tar.gz"
+    )
 )
 LOCAL_MODEL_DIR = Path("/tmp/modeldir")
 LOCAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-# Define your feature columns in EXACT order as model was trained on
 TRAIN_COLUMNS = [
     "url_length",
     "hostname_length",
@@ -52,8 +48,6 @@ TRAIN_COLUMNS = [
     "has_port",
     "url_entropy"
 ]
-
-# Map your numeric class indices back to label names
 LABEL_MAPPING = {
     0: "benign",
     1: "phishing",
@@ -61,116 +55,54 @@ LABEL_MAPPING = {
     3: "defacement"
 }
 
-# =====================
-# FEATURE EXTRACTION
-# =====================
-def shannon_entropy(s):
-    p, lns = Counter(s), float(len(s))
-    return -sum(count/lns * math.log2(count/lns) for count in p.values())
-
-def extract_url_features(url):
-    parsed = urlparse(url)
-    ext = tldextract.extract(url)
-
-    hostname = parsed.netloc
-    path = parsed.path
-    query = parsed.query
-
-    features = {}
-    features['url_length'] = len(url)
-    features['hostname_length'] = len(hostname)
-    features['path_length'] = len(path)
-    features['query_length'] = len(query)
-
-    features['num_dots'] = url.count('.')
-    features['num_hyphens'] = url.count('-')
-    features['num_at'] = url.count('@')
-    features['num_question_marks'] = url.count('?')
-    features['num_equals'] = url.count('=')
-    features['num_underscores'] = url.count('_')
-    features['num_ampersands'] = url.count('&')
-    features['num_digits'] = sum(c.isdigit() for c in url)
-
-    features['has_https'] = int(url.lower().startswith('https'))
-    features['uses_ip'] = int(
-        bool(re.search(r'http[s]?://(?:\d{1,3}\.){3}\d{1,3}', url))
-    )
-
-    features['num_subdomains'] = len(ext.subdomain.split('.')) if ext.subdomain else 0
-
-    suspicious_keywords = [
-        'login',
-        'secure',
-        'account',
-        'update',
-        'free',
-        'lucky',
-        'banking',
-        'confirm'
-    ]
-    for keyword in suspicious_keywords:
-        features[f'has_{keyword}'] = int(keyword in url.lower())
-
-    features['has_port'] = int(':' in hostname)
-    features['url_entropy'] = shannon_entropy(url)
-
-    return pd.Series(features)
-
-# =====================
-# MODEL LOADING WITH PICKLE FALLBACK
-# =====================
-def download_and_extract_from_s3(bucket, key, dest_dir):
-    print(f"Downloading model from s3://{bucket}/{key}")
-    s3 = boto3.client("s3")
-    local_tar = dest_dir / "model.tar.gz"
-    s3.download_file(bucket, key, str(local_tar))
-    print(f"Downloaded to {local_tar}")
-
-    with tarfile.open(str(local_tar), "r:gz") as tar:
-        tar.extractall(path=str(dest_dir))
-    print("Extracted files:", list(dest_dir.rglob("*")))
-
-def load_bst_model(model_dir: Path):
-    print("Searching for .bst model file in", model_dir)
-    candidates = list(model_dir.rglob("*.bst"))
-    if not candidates:
-        raise RuntimeError("No .bst model file found in " + str(model_dir))
-
-    model_file = candidates[0]
-    print(f"Loading XGBoost model from {model_file}")
-
-    booster = xgb.Booster()
-    booster.load_model(str(model_file))
-    print("Model loaded successfully")
-    return booster
-
-# =====================
-# FASTAPI APP
-# =====================
 app = FastAPI(title="Malicious URL Detection Service")
 MODEL = None
 
+
 @app.on_event("startup")
 def load_model_startup():
+    """
+    Event handler for FastAPI application startup.
+
+    This function downloads and extracts a model file from an S3 bucket,
+    then loads the model into the global variable `MODEL`. If any error occurs
+    during the process, it prints the error and raises the exception.
+
+    Raises:
+        Exception: If downloading, extracting, or loading the model fails.
+    """
     global MODEL
     try:
-        download_and_extract_from_s3(MODEL_S3_BUCKET, MODEL_S3_KEY, LOCAL_MODEL_DIR)
+        download_and_extract_from_s3(
+            MODEL_S3_BUCKET, MODEL_S3_KEY, LOCAL_MODEL_DIR
+        )
         MODEL = load_bst_model(LOCAL_MODEL_DIR)
     except Exception as e:
         print("Error loading model:", e)
         raise
 
+
 @app.get("/predict/{url:path}")
 def predict_url(url: str):
+    """
+    Predicts the class of a given URL using a pre-trained XGBoost model.
+    Args:
+        url (str): The URL path parameter, which will be decoded and processed.
+    Returns:
+        dict: A dictionary containing the decoded URL and its predicted
+            class label.
+    Raises:
+        HTTPException: If the model is not loaded or an error occurs
+            during prediction.
+    """
     global MODEL
     if MODEL is None:
         raise HTTPException(status_code=500, detail="Model not loaded")
 
     try:
-        print(f"Raw URL: {url}")
         decoded_url = unquote(url)
-        print(f"Decoded URL: {url}")
         features = extract_url_features(decoded_url)
+
         # Enforce feature column order
         features = features[TRAIN_COLUMNS]
 
@@ -183,4 +115,3 @@ def predict_url(url: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
