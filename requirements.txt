@@ -4,3 +4,4 @@ pandas
 xgboost
 boto3
 tldextract
+kafka-python
