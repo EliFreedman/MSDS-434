@@ -4,10 +4,10 @@ from urllib.parse import unquote
 
 import pandas as pd
 import xgboost as xgb
-from fastapi import FastAPI, HTTPException
-
 from data_ingestion import download_and_extract_from_s3, load_bst_model
 from data_processing import extract_url_features
+from fastapi import FastAPI, HTTPException
+from services import publish_prediction
 
 # This functions when utilizing an AWS EC2 cluster with the provisioned roles
 MODEL_S3_BUCKET = os.environ.get("MODEL_S3_BUCKET", "malicious-url-project")
@@ -109,9 +109,17 @@ def predict_url(url: str):
         dmatrix = xgb.DMatrix(pd.DataFrame([features]))
         pred_class = int(MODEL.predict(dmatrix)[0])
 
-        return {
+        result = {
             "url": decoded_url,
             "predicted_class": LABEL_MAPPING.get(pred_class, "unknown")
         }
+
+        # Publish result to Kafka topic (non-blocking, errors ignored)
+        try:
+            publish_prediction(result)
+        except Exception as pub_exc:
+            print(f"Kafka publish error: {pub_exc}")
+
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
