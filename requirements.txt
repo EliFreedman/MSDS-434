@@ -5,3 +5,4 @@ xgboost
 boto3
 tldextract
 kafka-python
+prometheus_fastapi_instrumentator
