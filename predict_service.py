@@ -7,6 +7,7 @@ import xgboost as xgb
 from data_ingestion import download_and_extract_from_s3, load_bst_model
 from data_processing import extract_url_features
 from fastapi import FastAPI, HTTPException
+from prometheus_fastapi_instrumentator import Instrumentator
 from services import publish_prediction
 
 # This functions when utilizing an AWS EC2 cluster with the provisioned roles
@@ -57,6 +58,8 @@ LABEL_MAPPING = {
 
 app = FastAPI(title="Malicious URL Detection Service")
 MODEL = None
+
+Instrumentator().instrument(app).expose(app)
 
 
 @app.on_event("startup")
